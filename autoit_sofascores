@@ -1,0 +1,625 @@
+#include <Inet.au3>
+#include <json.au3>
+#include <Array.au3>
+#include <String.au3>
+#include <File.au3>
+#include <UnixTime.au3>
+
+$TitleString = "Team|Score"
+
+; Read configuration from .ini file
+$ConfigFile = "C:\Users\jking\Documents\betangel bots\1. AutoIt\1.Config\config.ini"
+If Not FileExists($ConfigFile) Then
+ConsoleWrite("Error: Config file " & $ConfigFile & " does not exist" & @CRLF)
+Exit
+EndIf
+
+; Paths
+$ScriptDir = IniRead($ConfigFile, "Paths", "ScriptDir", "C:\Users\jking\Documents\betangel bots\1. AutoIt\1.Config")
+$ScoreFile = $ScriptDir & "" & IniRead($ConfigFile, "Paths", "ScoreFile", "score.csv")
+$TempScoreFile = $ScriptDir & "" & IniRead($ConfigFile, "Paths", "TempScoreFile", "score_temp.csv")
+$TestFile = $ScriptDir & "" & IniRead($ConfigFile, "Paths", "TestFile", "test.json")
+$DebugFile = $ScriptDir & "" & IniRead($ConfigFile, "Paths", "DebugFile", "debug.json")
+
+; API URLs
+$EventsURL = IniRead($ConfigFile, "API", "EventsURL", "https://api.sofascore.com/api/v1/sport/football/events/live")
+$IncidentsURLTemplate = IniRead($ConfigFile, "API", "IncidentsURL", "https://api.sofascore.com/api/v1/event/{EventID}/incidents")
+$StatsURLTemplate = IniRead($ConfigFile, "API", "StatsURL", "https://api.sofascore.com/api/v1/event/{EventID}/statistics")
+$GraphURLTemplate = IniRead($ConfigFile, "API", "GraphURL", "https://api.sofascore.com/api/v1/event/{EventID}/graph")
+
+; Tournaments
+$HighQualityTournaments = StringSplit(IniRead($ConfigFile, "HighQualityTournaments", "HighQualityTournaments", "17,8,35,23,34,7,18,37"), ",", $STR_NOCOUNT)
+$LowQualityTournaments = StringSplit(IniRead($ConfigFile, "LowQualityTournaments", "LowQualityTournaments", ""), ",", $STR_NOCOUNT)
+
+; Team mappings
+Local $TeamMap[0][2]
+$TeamSection = IniReadSection($ConfigFile, "TeamMappings")
+If Not @error Then
+ReDim $TeamMap[$TeamSection[0][0]][2]
+For $i = 1 To $TeamSection[0][0]
+Local $Pair = StringSplit($TeamSection[$i][1], ",", $STR_NOCOUNT)
+If UBound($Pair) = 2 Then
+$TeamMap[$i-1][0] = $Pair[0]
+$TeamMap[$i-1][1] = $Pair[1]
+EndIf
+Next
+EndIf
+
+; Settings
+$SleepFirstHalf = Int(IniRead($ConfigFile, "Settings", "SleepFirstHalf", "15000"))
+$SleepSecondHalf = Int(IniRead($ConfigFile, "Settings", "SleepSecondHalf", "30000"))
+$MaxGameTime = Int(IniRead($ConfigFile, "Settings", "MaxGameTime", "120"))
+
+DirCreate($ScriptDir)
+
+Global $CycleCount = 0
+Global $GameTimeMinutes = 0 ; Initialize globally for sleep logic
+
+While 1
+$CycleCount += 1
+ConsoleWrite("=== Starting cycle " & $CycleCount & " at " & _StringFormatTime("%Y-%m-%d %H:%M:%S", _TimeGetStamp()) & " ===" & @CRLF)
+
+; Verify directory
+If Not FileExists($ScriptDir) Then
+ConsoleWrite("Error: Directory " & $ScriptDir & " does not exist" & @CRLF)
+Sleep($SleepSecondHalf)
+ContinueLoop
+EndIf
+
+; Fetch live events
+ConsoleWrite("Fetching live events from API" & @CRLF)
+$data = _INetGetSource($EventsURL)
+If @error Then
+ConsoleWrite("Error: Failed to fetch events from " & $EventsURL & ", error code: " & @error & @CRLF)
+Sleep(60000)
+ContinueLoop
+EndIf
+ConsoleWrite("Events API response length: " & StringLen($data) & " bytes, first 200 chars: " & StringLeft($data, 200) & @CRLF)
+
+; Save raw events response for debugging (every 10 cycles)
+If Mod($CycleCount, 10) = 0 Then
+Local $hDebugFile = FileOpen($DebugFile, 2)
+If $hDebugFile <> -1 Then
+FileWrite($hDebugFile, $data)
+FileClose($hDebugFile)
+ConsoleWrite("Saved raw events response to " & $DebugFile & @CRLF)
+Else
+ConsoleWrite("Error: Failed to write debug file " & $DebugFile & ", Windows error: " & _WinAPI_GetLastError() & @CRLF)
+EndIf
+EndIf
+
+$object = json_decode($data)
+If @error Then
+ConsoleWrite("Error: Failed to decode events JSON, error code: " & @error & @CRLF)
+Sleep($SleepSecondHalf)
+ContinueLoop
+EndIf
+
+Local $Count = Json_Get($object, '.events')
+If @error Or Not IsArray($Count) Then
+ConsoleWrite("Error: Failed to access events array or not an array, JSON error: " & @error & @CRLF)
+Sleep($SleepSecondHalf)
+ContinueLoop
+EndIf
+ConsoleWrite("Found " & UBound($Count) & " live events" & @CRLF)
+
+Local $ProcessedEvents = 0
+Local $ScoreBuffer = "1" & @CRLF ; Bet Angel data format code
+
+; Process all events
+For $i = 0 To UBound($Count) - 1
+ConsoleWrite("Starting processing for event index " & $i & @CRLF)
+Local $Event = Json_Get($object, '.events[' & $i & ']')
+
+; Get tournament details
+$TournamentID = Json_Get($Event, '.tournament.uniqueTournament.id')
+If @error Or $TournamentID = "" Then
+$TournamentID = Json_Get($Event, '.tournament.id')
+If @error Or $TournamentID = "" Then
+ConsoleWrite("Error: Failed to access tournament ID for event index " & $i & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+EndIf
+Local $IsHighQuality = _ArraySearch($HighQualityTournaments, $TournamentID) <> -1
+Local $IsLowQuality = _ArraySearch($LowQualityTournaments, $TournamentID) <> -1
+If Not $IsHighQuality And Not $IsLowQuality Then
+ConsoleWrite("Skipping event from tournament ID " & $TournamentID & " (not in high or low-quality list)" & @CRLF)
+ContinueLoop
+EndIf
+$TournamentName = Json_Get($Event, '.tournament.name')
+If @error Then
+ConsoleWrite("Error: Failed to access tournament name for event index " & $i & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+ConsoleWrite("Processing event from tournament: " & $TournamentName & " (ID: " & $TournamentID & ", Quality: " & ($IsHighQuality ? "High" : "Low") & ")" & @CRLF)
+
+$HomeTeamRaw = Json_Get($Event, '.homeTeam.name')
+If @error Or $HomeTeamRaw = "" Then
+ConsoleWrite("Error: Failed to access home team name for event index " & $i & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+$AwayTeamRaw = Json_Get($Event, '.awayTeam.name')
+If @error Or $AwayTeamRaw = "" Then
+ConsoleWrite("Error: Failed to access away team name for event index " & $i & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+$HomeTeam = MapTeamName(_StringReplaceAccent($HomeTeamRaw))
+$AwayTeam = MapTeamName(_StringReplaceAccent($AwayTeamRaw))
+If $HomeTeam = "NotFound" Or $AwayTeam = "NotFound" Then
+ConsoleWrite("Error: Team name processing failed - Home: " & $HomeTeamRaw & " -> " & $HomeTeam & ", Away: " & $AwayTeamRaw & " -> " & $AwayTeam & @CRLF)
+ContinueLoop
+EndIf
+ConsoleWrite("Raw home team: " & $HomeTeamRaw & ", Processed: " & $HomeTeam & @CRLF)
+ConsoleWrite("Raw away team: " & $AwayTeamRaw & ", Processed: " & $AwayTeam & @CRLF)
+
+$EventID = Json_Get($Event, '.id')
+If @error Or $EventID = "" Then
+ConsoleWrite("Error: Failed to access event ID for event index " & $i & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+ConsoleWrite("Processing event ID: " & $EventID & ", Home: " & $HomeTeam & ", Away: " & $AwayTeam & ", Tournament: " & $TournamentName & " (ID: " & $TournamentID & ")" & @CRLF)
+$ProcessedEvents += 1
+
+; Get kick-off time and game time
+$StartTimestamp = Json_Get($Event, '.startTimestamp')
+If @error Or $StartTimestamp = "" Or Not StringIsInt($StartTimestamp) Then
+ConsoleWrite("Error: Failed to get valid startTimestamp for event ID " & $EventID & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+$MarketTime = _StringFormatTime("%H:%M", $StartTimestamp)
+$CurrentTime = _TimeGetStamp()
+$GameTimeMinutes = Floor(($CurrentTime - $StartTimestamp) / 60)
+If $GameTimeMinutes < 0 Then $GameTimeMinutes = 0
+If $GameTimeMinutes > $MaxGameTime Then $GameTimeMinutes = $MaxGameTime
+ConsoleWrite("GameTime for event ID " & $EventID & ": " & $GameTimeMinutes & " minutes" & @CRLF)
+
+; Base CSV strings
+$HomeBase = "," & $MarketTime & "," & $HomeTeam & ",1"
+$AwayBase = "," & $MarketTime & "," & $AwayTeam & ",2"
+
+; Initialize SV buffers
+Local $HomeSVs = ""
+Local $AwaySVs = ""
+Local $StatWarnings = ""
+
+; Write scores
+$HomeScore = Json_Get($Event, '.homeScore.current')
+If @error Or $HomeScore = "" Then
+$StatWarnings &= "Invalid home score for event ID " & $EventID & ", raw value: " & $HomeScore & ", defaulting to 0\n"
+$HomeScore = "0"
+ElseIf Not StringIsInt($HomeScore) Then
+$StatWarnings &= "Non-integer home score for event ID " & $EventID & ", raw value: " & $HomeScore & ", using as-is\n"
+EndIf
+$AwayScore = Json_Get($Event, '.awayScore.current')
+If @error Or $AwayScore = "" Then
+$StatWarnings &= "Invalid away score for event ID " & $EventID & ", raw value: " & $AwayScore & ", defaulting to 0\n"
+$AwayScore = "0"
+ElseIf Not StringIsInt($AwayScore) Then
+$StatWarnings &= "Non-integer away score for event ID " & $EventID & ", raw value: " & $AwayScore & ", using as-is\n"
+EndIf
+$HomeSVs &= ",SS,Score," & $HomeScore
+$AwaySVs &= ",SS,Score," & $AwayScore
+
+; Write game time
+$HomeSVs &= ",SS,GameTime," & $GameTimeMinutes
+$AwaySVs &= ",SS,GameTime," & $GameTimeMinutes
+
+If $IsHighQuality Then
+; Fetch red card data
+ConsoleWrite("Fetching incidents for event ID " & $EventID & @CRLF)
+$IncidentsURL = StringReplace($IncidentsURLTemplate, "{EventID}", $EventID)
+$IncidentsData = _INetGetSource($IncidentsURL)
+Local $HomeRedCards = 0, $AwayRedCards = 0
+If Not @error And $IncidentsData <> "" Then
+$IncidentsObject = json_decode($IncidentsData)
+If Not @error Then
+Local $Incidents = Json_Get($IncidentsObject, '.incidents')
+If Not @error And IsArray($Incidents) Then
+For $j = 0 To UBound($Incidents) - 1
+Local $Type = Json_Get($Incidents, '[' & $j & '].type')
+Local $CardType = Json_Get($Incidents, '[' & $j & '].cardType')
+Local $TeamSide = Json_Get($Incidents, '[' & $j & '].teamSide')
+If $Type = "card" And $CardType = "red" Then
+If $TeamSide = "home" Then
+$HomeRedCards += 1
+ElseIf $TeamSide = "away" Then
+$AwayRedCards += 1
+EndIf
+EndIf
+Next
+EndIf
+EndIf
+Else
+ConsoleWrite("Error: Failed to fetch incidents for event ID " & $EventID & ", error code: " & @error & @CRLF)
+EndIf
+$HomeSVs &= ",SS,RedCards," & $HomeRedCards
+$AwaySVs &= ",SS,RedCards," & $AwayRedCards
+
+; Fetch statistics data
+ConsoleWrite("Fetching stats for event ID " & $EventID & @CRLF)
+$StatsURL = StringReplace($StatsURLTemplate, "{EventID}", $EventID)
+$StatsData = _INetGetSource($StatsURL)
+If @error Then
+ConsoleWrite("Error: Failed to fetch stats for event ID " & $EventID & ", error code: " & @error & @CRLF)
+Local $Keys[13] = ["shotsOnGoal", "shotsOffGoal", "totalShotsOnGoal", "cornerKicks", "bigChanceCreated", "fouls", "goalkeeperSaves", "hitWoodwork", "totalShotsInsideBox", "totalShotsOutsideBox", "yellowCards", "expectedGoals", "ballPossession"]
+For $k In $Keys
+Switch $k
+Case "shotsOnGoal"
+$HomeSVs &= ",SS,ShotsOnTarget,0"
+$AwaySVs &= ",SS,ShotsOnTarget,0"
+Case "shotsOffGoal"
+$HomeSVs &= ",SS,ShotsOffTarget,0"
+$AwaySVs &= ",SS,ShotsOffTarget,0"
+Case "totalShotsOnGoal"
+$HomeSVs &= ",SS,TotalShots,0"
+$AwaySVs &= ",SS,TotalShots,0"
+Case "ballPossession"
+$HomeSVs &= ",SS,Possession,0"
+$AwaySVs &= ",SS,Possession,0"
+Case "cornerKicks"
+$HomeSVs &= ",SS,Corners,0"
+$AwaySVs &= ",SS,Corners,0"
+Case "bigChanceCreated"
+$HomeSVs &= ",SS,BigChances,0"
+$AwaySVs &= ",SS,BigChances,0"
+Case "fouls"
+$HomeSVs &= ",SS,Fouls,0"
+$AwaySVs &= ",SS,Fouls,0"
+Case "goalkeeperSaves"
+$HomeSVs &= ",SS,Saves,0"
+$AwaySVs &= ",SS,Saves,0"
+Case "hitWoodwork"
+$HomeSVs &= ",SS,HitWoodwork,0"
+$AwaySVs &= ",SS,HitWoodwork,0"
+Case "totalShotsInsideBox"
+$HomeSVs &= ",SS,ShotsInsideBox,0"
+$AwaySVs &= ",SS,ShotsInsideBox,0"
+Case "totalShotsOutsideBox"
+$HomeSVs &= ",SS,ShotsOutsideBox,0"
+$AwaySVs &= ",SS,ShotsOutsideBox,0"
+Case "yellowCards"
+$HomeSVs &= ",SS,YellowCards,0"
+$AwaySVs &= ",SS,YellowCards,0"
+Case "expectedGoals"
+$HomeSVs &= ",SS,ExpectedGoals,0"
+$AwaySVs &= ",SS,ExpectedGoals,0"
+EndSwitch
+Next
+Else
+ConsoleWrite("Stats API response length for event ID " & $EventID & ": " & StringLen($StatsData) & " bytes, first 200 chars: " & StringLeft($StatsData, 200) & @CRLF)
+If Mod($CycleCount, 10) = 0 Then
+Local $hDebugStatsFile = FileOpen($DebugFile & "." & $EventID, 2)
+If $hDebugStatsFile <> -1 Then
+FileWrite($hDebugStatsFile, $StatsData)
+FileClose($hDebugStatsFile)
+ConsoleWrite("Saved raw stats response to " & $DebugFile & "." & $EventID & @CRLF)
+Else
+ConsoleWrite("Error: Failed to write debug stats file for event ID " & $EventID & ", Windows error: " & _WinAPI_GetLastError() & @CRLF)
+EndIf
+EndIf
+
+If $StatsData <> "" Then
+$StatsObject = json_decode($StatsData)
+If @error Then
+ConsoleWrite("Error: Failed to decode stats JSON for event ID " & $EventID & ", error code: " & @error & @CRLF)
+ContinueLoop
+EndIf
+Local $Groups = Json_Get($StatsObject, '.statistics[0].groups')
+If @error Then
+ConsoleWrite("Error: Failed to access statistics groups for event ID " & $EventID & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+Local $ProcessedKeys[0]
+For $g = 0 To UBound($Groups) - 1
+Local $Items = Json_Get($Groups, '[' & $g & '].statisticsItems')
+If @error Then
+ConsoleWrite("Error: Failed to access statistics items for group " & $g & ", event ID " & $EventID & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+For $s = 0 To UBound($Items) - 1
+Local $Key = Json_Get($Items, '[' & $s & '].key')
+If @error Or $Key = "" Then
+ConsoleWrite("Error: Failed to access key for item " & $s & ", group " & $g & ", event ID " & $EventID & ", JSON error: " & @error & @CRLF)
+ContinueLoop
+EndIf
+If _ArraySearch($ProcessedKeys, $Key) <> -1 Then
+ConsoleWrite("Skipping duplicate stat key: " & $Key & " for event ID " & $EventID & @CRLF)
+ContinueLoop
+EndIf
+_ArrayAdd($ProcessedKeys, $Key)
+Local $HomeValue = Json_Get($Items, '[' & $s & '].homeValue')
+If @error Or $HomeValue = "" Then
+$StatWarnings &= "Invalid home value for stat " & $Key & ", event ID " & $EventID & ", raw value: " & $HomeValue & "\n"
+$HomeValue = "0"
+ElseIf StringInStr($HomeValue, "%") Then
+$HomeValue = StringReplace($HomeValue, "%", "")
+If Not StringIsFloat($HomeValue) Then
+$StatWarnings &= "Invalid percentage home value for stat " & $Key & ", event ID " & $EventID & ", raw value: " & $HomeValue & "\n"
+$HomeValue = "0"
+EndIf
+ElseIf Not StringIsFloat($HomeValue) Then
+$StatWarnings &= "Invalid home value for stat " & $Key & ", event ID " & $EventID & ", raw value: " & $HomeValue & "\n"
+$HomeValue = "0"
+EndIf
+Local $AwayValue = Json_Get($Items, '[' & $s & '].awayValue')
+If @error Or $AwayValue = "" Then
+$StatWarnings &= "Invalid away value for stat " & $Key & ", event ID " & $EventID & ", raw value: " & $AwayValue & "\n"
+$AwayValue = "0"
+ElseIf StringInStr($AwayValue, "%") Then
+$AwayValue = StringReplace($AwayValue, "%", "")
+If Not StringIsFloat($AwayValue) Then
+$StatWarnings &= "Invalid percentage away value for stat " & $Key & ", event ID " & $EventID & ", raw value: " & $AwayValue & "\n"
+$AwayValue = "0"
+EndIf
+ElseIf Not StringIsFloat($AwayValue) Then
+$StatWarnings &= "Invalid away value for stat " & $Key & ", event ID " & $EventID & ", raw value: " & $AwayValue & "\n"
+$AwayValue = "0"
+EndIf
+ConsoleWrite("Processing stat for event ID " & $EventID & ": Key=" & $Key & ", HomeValue=" & $HomeValue & ", AwayValue=" & $AwayValue & @CRLF)
+Switch $Key
+Case "shotsOnGoal"
+$HomeSVs &= ",SS,ShotsOnTarget," & $HomeValue
+$AwaySVs &= ",SS,ShotsOnTarget," & $AwayValue
+Case "shotsOffGoal"
+$HomeSVs &= ",SS,ShotsOffTarget," & $HomeValue
+$AwaySVs &= ",SS,ShotsOffTarget," & $AwayValue
+Case "totalShotsOnGoal"
+$HomeSVs &= ",SS,TotalShots," & $HomeValue
+$AwaySVs &= ",SS,TotalShots," & $AwayValue
+Case "ballPossession"
+$HomeSVs &= ",SS,Possession," & $HomeValue
+$AwaySVs &= ",SS,Possession," & $AwayValue
+Case "cornerKicks"
+$HomeSVs &= ",SS,Corners," & $HomeValue
+$AwaySVs &= ",SS,Corners," & $AwayValue
+Case "bigChanceCreated"
+$HomeSVs &= ",SS,BigChances," & $HomeValue
+$AwaySVs &= ",SS,BigChances," & $AwayValue
+Case "fouls"
+$HomeSVs &= ",SS,Fouls," & $HomeValue
+$AwaySVs &= ",SS,Fouls," & $AwayValue
+Case "goalkeeperSaves"
+$HomeSVs &= ",SS,Saves," & $HomeValue
+$AwaySVs &= ",SS,Saves," & $AwayValue
+Case "hitWoodwork"
+$HomeSVs &= ",SS,HitWoodwork," & $HomeValue
+$AwaySVs &= ",SS,HitWoodwork," & $AwayValue
+Case "totalShotsInsideBox"
+$HomeSVs &= ",SS,ShotsInsideBox," & $HomeValue
+$AwaySVs &= ",SS,ShotsInsideBox," & $AwayValue
+Case "totalShotsOutsideBox"
+$HomeSVs &= ",SS,ShotsOutsideBox," & $HomeValue
+$AwaySVs &= ",SS,ShotsOutsideBox," & $AwayValue
+Case "yellowCards"
+$HomeSVs &= ",SS,YellowCards," & $HomeValue
+$AwaySVs &= ",SS,YellowCards," & $AwayValue
+Case "expectedGoals"
+$HomeSVs &= ",SS,ExpectedGoals," & $HomeValue
+$AwaySVs &= ",SS,ExpectedGoals," & $AwayValue
+EndSwitch
+Next
+Next
+; Log stat warnings
+If $StatWarnings <> "" Then
+Local $hDebugStatsFile = FileOpen($DebugFile & "." & $EventID & ".warnings", 2)
+If $hDebugStatsFile <> -1 Then
+FileWrite($hDebugStatsFile, $StatWarnings & "\nRaw Stats: " & $StatsData)
+FileClose($hDebugStatsFile)
+ConsoleWrite("Saved stat warnings to " & $DebugFile & "." & $EventID & ".warnings" & @CRLF)
+EndIf
+EndIf
+EndIf
+EndIf
+
+; Fetch momentum graph data
+ConsoleWrite("Fetching momentum graph for event ID " & $EventID & @CRLF)
+$GraphURL = StringReplace($GraphURLTemplate, "{EventID}", $EventID)
+$GraphData = _INetGetSource($GraphURL)
+Local $5MinAvgPressure = 0, $10MinAvgPressure = 0, $Momentum1 = 0
+Local $5MinPeakPressure = 0, $5MinLowPressure = 0, $MomentumTrend = 0
+If Not @error And $GraphData <> "" Then
+$GraphObject = json_decode($GraphData)
+If Not @error Then
+Local $GraphPoints = Json_Get($GraphObject, '.graphPoints')
+If Not @error And IsArray($GraphPoints) Then
+Local $GraphCount = UBound($GraphPoints)
+; Calculate 5-minute average, peak, and low pressure
+Local $GraphTotal = 0, $PointsCount = 0
+Local $Peak = -999, $Low = 999
+For $y = $GraphCount - 1 To ($GraphCount - 5 < 0 ? 0 : $GraphCount - 5) Step -1
+Local $Value = Json_Get($GraphPoints, '[' & $y & '].value')
+If Not @error And StringIsFloat($Value) Then
+$GraphTotal += $Value
+$PointsCount += 1
+If $Value > $Peak Then $Peak = $Value
+If $Value < $Low Then $Low = $Value
+EndIf
+Next
+If $PointsCount > 0 Then
+$5MinAvgPressure = Round($GraphTotal / $PointsCount)
+$5MinPeakPressure = $Peak
+$5MinLowPressure = $Low
+EndIf
+; Calculate 10-minute average pressure
+Local $GraphTotal = 0, $PointsCount = 0
+For $y = $GraphCount - 1 To ($GraphCount - 10 < 0 ? 0 : $GraphCount - 10) Step -1
+Local $Value = Json_Get($GraphPoints, '[' & $y & '].value')
+If Not @error And StringIsFloat($Value) Then
+$GraphTotal += $Value
+$PointsCount += 1
+EndIf
+Next
+If $PointsCount > 0 Then
+$10MinAvgPressure = Round($GraphTotal / $PointsCount)
+EndIf
+; Get latest momentum and trend
+If $GraphCount > 0 Then
+$Momentum1 = Json_Get($GraphPoints, '[' & ($GraphCount - 1) & '].value')
+If @error Or Not StringIsFloat($Momentum1) Then $Momentum1 = 0
+If $GraphCount > 3 Then
+Local $SumDiff = 0, $CountDiff = 0
+For $y = $GraphCount - 1 To $GraphCount - 4 Step -1
+Local $Value = Json_Get($GraphPoints, '[' & $y & '].value')
+Local $PrevValue = Json_Get($GraphPoints, '[' & ($y - 1) & '].value')
+If Not @error And Not @error And StringIsFloat($Value) And StringIsFloat($PrevValue) Then
+$SumDiff += ($Value - $PrevValue)
+$CountDiff += 1
+EndIf
+Next
+$MomentumTrend = $CountDiff > 0 ? Round($SumDiff / $CountDiff) : 0
+EndIf
+EndIf
+EndIf
+EndIf
+Else
+ConsoleWrite("Error: Failed to fetch momentum graph for event ID " & $EventID & ", error code: " & @error & @CRLF)
+EndIf
+$HomeSVs &= ",SS,5MinAvgPressure," & $5MinAvgPressure
+$AwaySVs &= ",SS,5MinAvgPressure," & -$5MinAvgPressure
+$HomeSVs &= ",SS,10MinAvgPressure," & $10MinAvgPressure
+$AwaySVs &= ",SS,10MinAvgPressure," & -$10MinAvgPressure
+$HomeSVs &= ",SS,Momentum1," & $Momentum1
+$AwaySVs &= ",SS,Momentum1," & -$Momentum1
+$HomeSVs &= ",SS,5MinPeakPressure," & $5MinPeakPressure
+$AwaySVs &= ",SS,5MinPeakPressure," & -$5MinPeakPressure
+$HomeSVs &= ",SS,5MinLowPressure," & $5MinLowPressure
+$AwaySVs &= ",SS,5MinLowPressure," & -$5MinLowPressure
+$HomeSVs &= ",SS,MomentumTrend," & $MomentumTrend
+$AwaySVs &= ",SS,MomentumTrend," & -$MomentumTrend
+Else
+; For low-quality tournaments, set default values
+$HomeSVs &= ",SS,RedCards,0"
+$AwaySVs &= ",SS,RedCards,0"
+Local $Keys[13] = ["shotsOnGoal", "shotsOffGoal", "totalShotsOnGoal", "cornerKicks", "bigChanceCreated", "fouls", "goalkeeperSaves", "hitWoodwork", "totalShotsInsideBox", "totalShotsOutsideBox", "yellowCards", "expectedGoals", "ballPossession"]
+For $k In $Keys
+Switch $k
+Case "shotsOnGoal"
+$HomeSVs &= ",SS,ShotsOnTarget,0"
+$AwaySVs &= ",SS,ShotsOnTarget,0"
+Case "shotsOffGoal"
+$HomeSVs &= ",SS,ShotsOffTarget,0"
+$AwaySVs &= ",SS,ShotsOffTarget,0"
+Case "totalShotsOnGoal"
+$HomeSVs &= ",SS,TotalShots,0"
+$AwaySVs &= ",SS,TotalShots,0"
+Case "ballPossession"
+$HomeSVs &= ",SS,Possession,0"
+$AwaySVs &= ",SS,Possession,0"
+Case "cornerKicks"
+$HomeSVs &= ",SS,Corners,0"
+$AwaySVs &= ",SS,Corners,0"
+Case "bigChanceCreated"
+$HomeSVs &= ",SS,BigChances,0"
+$AwaySVs &= ",SS,BigChances,0"
+Case "fouls"
+$HomeSVs &= ",SS,Fouls,0"
+$AwaySVs &= ",SS,Fouls,0"
+Case "goalkeeperSaves"
+$HomeSVs &= ",SS,Saves,0"
+$AwaySVs &= ",SS,Saves,0"
+Case "hitWoodwork"
+$HomeSVs &= ",SS,HitWoodwork,0"
+$AwaySVs &= ",SS,HitWoodwork,0"
+Case "totalShotsInsideBox"
+$HomeSVs &= ",SS,ShotsInsideBox,0"
+$AwaySVs &= ",SS,ShotsInsideBox,0"
+Case "totalShotsOutsideBox"
+$HomeSVs &= ",SS,ShotsOutsideBox,0"
+$AwaySVs &= ",SS,ShotsOutsideBox,0"
+Case "yellowCards"
+$HomeSVs &= ",SS,YellowCards,0"
+$AwaySVs &= ",SS,YellowCards,0"
+Case "expectedGoals"
+$HomeSVs &= ",SS,ExpectedGoals,0"
+$AwaySVs &= ",SS,ExpectedGoals,0"
+EndSwitch
+Next
+$HomeSVs &= ",SS,5MinAvgPressure,0,SS,10MinAvgPressure,0,SS,Momentum1,0,SS,5MinPeakPressure,0,SS,5MinLowPressure,0,SS,MomentumTrend,0"
+$AwaySVs &= ",SS,5MinAvgPressure,0,SS,10MinAvgPressure,0,SS,Momentum1,0,SS,5MinPeakPressure,0,SS,5MinLowPressure,0,SS,MomentumTrend,0"
+EndIf
+
+; Write rows to buffer
+$ScoreBuffer &= $HomeBase & $HomeSVs & @CRLF
+$AwaySVs &= $AwayBase & $AwaySVs & @CRLF
+Next
+
+ConsoleWrite("Processed " & $ProcessedEvents & " events" & @CRLF)
+ConsoleWrite("ScoreBuffer content (first 500 chars): " & StringLeft($ScoreBuffer, 500) & @CRLF)
+
+; Write score.csv with retry
+Local $bWritten = False
+For $retry = 1 To 3
+Local $hScoreFile = FileOpen($TempScoreFile, 2)
+If $hScoreFile <> -1 Then
+FileWrite($hScoreFile, $ScoreBuffer)
+FileClose($hScoreFile)
+FileMove($TempScoreFile, $ScoreFile, 1)
+ConsoleWrite("Successfully wrote and moved to " & $ScoreFile & ", length: " & StringLen($ScoreBuffer) & " bytes" & @CRLF)
+$bWritten = True
+ExitLoop
+Else
+ConsoleWrite("Retry " & $retry & ": Failed to open " & $TempScoreFile & " for writing, Windows error: " & _WinAPI_GetLastError() & @CRLF)
+Sleep(2000)
+EndIf
+Next
+
+If Not $bWritten Then
+ConsoleWrite("Error: Failed to write to " & $ScoreFile & " after 3 retries" & @CRLF)
+EndIf
+
+; Test file write
+Local $hTestFile = FileOpen($TestFile, 2)
+If $hTestFile <> -1 Then
+FileWrite($hTestFile, '{"test": "success"}')
+FileClose($hTestFile)
+ConsoleWrite("Successfully wrote test file to " & $TestFile & @CRLF)
+Else
+ConsoleWrite("Error: Failed to write test file to " & $TestFile & ", Windows error: " & _WinAPI_GetLastError() & @CRLF)
+EndIf
+
+Local $SleepTime = $GameTimeMinutes < 45 ? $SleepFirstHalf : $SleepSecondHalf
+ConsoleWrite("Sleeping for " & ($SleepTime / 1000) & " seconds" & @CRLF)
+Sleep($SleepTime)
+WEnd
+
+Func MapTeamName($Name)
+For $i = 0 To UBound($TeamMap) - 1
+If $Name = $TeamMap[$i][0] Or StringInStr($Name, $TeamMap[$i][0]) Then Return $TeamMap[$i][1]
+Next
+Local $e = StringSplit($Name, " ", $STR_NOCOUNT)
+If UBound($e) = 0 Then Return "NotFound"
+Local $f = $Name ; Prefer full name
+For $z = 0 To UBound($e) - 1
+If StringLen($e[$z]) > 3 And Not StringRegExp($e[$z], "^(FC|SC|CF|AC|AS|CD|CA|Red|Bull|Club)$") Then
+$f = $e[$z]
+ExitLoop
+EndIf
+Next
+If $f = "NotFound" And UBound($e) > 0 Then $f = $e[0]
+Return $f
+EndFunc
+
+Func _StringReplaceAccent($sString)
+Local $exp, $rep
+Local $Pattern[28][2] = [ _
+["[ÀÁÂÃÅÆ]", "A"], ["[àáâãåa]", "a"], ["Ä", "Ae"], ["[æä]", "ae"], _
+["Þ", "B"], ["þ", "b"], _
+["ÇC", "C"], ["[çcc]", "c"], _
+["[ÈÉÊË]", "E"], ["[èéêë]", "e"], _
+["[ÌÍÎÏ]", "I"], ["[ìíîï]", "i"], _
+["Ñ", "N"], ["ñ", "n"], _
+["[ÒÓÔÕÖØ]", "O"], ["[ðòóôõöø]", "o"], _
+["r", "r"], _
+["[ŠS]", "S"], ["[š]", "s"], _
+["ß", "Ss"], _
+["[ÙÚÛ]", "U"], ["[ùúû]", "u"], ["Ü", "Ue"], ["ü", "ue"], _
+["Ý", "Y"], ["[ýýÿ]", "y"], _
+["Ž", "Z"], ["ž", "z"]]
+For $i = 0 To UBound($Pattern) - 1
+$exp = $Pattern[$i][0]
+If $exp = "" Then ContinueLoop
+$rep = $Pattern[$i][1]
+$sString = StringRegExpReplace($sString, $exp, $rep)
+Next
+Return $sString
+EndFunc
